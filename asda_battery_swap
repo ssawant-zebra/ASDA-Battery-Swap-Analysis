@@ -1,0 +1,178 @@
+ create or replace TEMP table `site_data` as ( select  distinct serial_number,master_id,slot_date,site_name,from
+(Select serial_number, master_id,slot_date,site_name,
+ROW_NUMBER() OVER(PARTITION BY serial_number, slot_date ORDER BY site_name) AS first_created
+-- FROM `gms-ds-algorithms-sb.looker_data_modelling_eu.serial_number_master_id_mapping`
+from `viq-st-eu-p.viq_operation.t_device_store_carry_forward_history`
+ where slot_date between  "2024-05-01" and  "2024-05-31"  and master_id=96487 
+ )where first_created = 1);
+
+
+-- Since data is not consistent for all the dates I am asuming the device does not change sites
+-- Hence not applying filter and shift_date between  "2024-10-01" and  "2024-10-31"
+-- Create variables to get count of devices by site,model_number and at overall site level
+create or replace TEMP table asda_site_data as (
+  select *, COUNT(DISTINCT(serial_number)) OVER(PARTITION BY site_name,model_number) AS total_device_cnt_by_model,
+  COUNT(DISTINCT(serial_number)) OVER(PARTITION BY site_name) AS total_device_cnt_by_site from(
+select *,ROW_NUMBER() OVER(PARTITION BY serial_number ORDER BY site_name) AS first_created from(
+select distinct serial_number, company_name,master_id,site_name,model_number,shift_date from
+`gms-ds-algorithms-sb.dms_eu.t_actionable_insights` 
+where master_id = 114047 ) )where first_created = 1);
+
+
+ create or replace TEMP table `battery_data` as ( select distinct
+    _e AS serialnumber,CONCAT(battery_partnumber, battery_manufacturing_date, battery_serial_number) AS bid,
+    extract(date from TIMESTAMP_MILLIS(_r)) AS device_date,
+    extract(hour from TIMESTAMP_MILLIS(_r)) as device_hour,
+    extract(minute from TIMESTAMP_MILLIS(_r)) as device_min,
+    battery_level,ac_line_status,
+    COUNT(DISTINCT(_e)) OVER(PARTITION BY EXTRACT(date FROM TIMESTAMP_MILLIS(_r))) AS total_sn_cnt,
+    first_value(battery_level) over (partition by _e,extract(date from TIMESTAMP_MILLIS(_r)),extract(hour from TIMESTAMP_MILLIS(_r))  
+    order by extract(minute from TIMESTAMP_MILLIS(_r)) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as first_battery_val,
+    last_value(battery_level) over (partition by _e,extract(date from TIMESTAMP_MILLIS(_r)),extract(hour from TIMESTAMP_MILLIS(_r))  
+    order by extract(minute from TIMESTAMP_MILLIS(_r)) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as last_battery_val
+  FROM
+    `es-s2dl-core-p.emc_eu.t_zagent_battery`
+  WHERE
+    DATE(_et) between  "2024-09-01" and  "2024-09-30"
+    AND DATE(TIMESTAMP_MILLIS(_r)) BETWEEN "2024-09-01" and  "2024-09-30"
+  --  and _e in ("22168522519775" )
+   and ac_line_status >=0
+    AND CONCAT(battery_partnumber, battery_manufacturing_date, battery_serial_number) != "UnknownUnknownUnknown"
+  ORDER BY serialnumber,device_date, device_hour,device_min asc);
+
+
+create or replace TEMP table `battery_data_1` as (
+  select a.*,b.company_name,b.master_id,b.site_name,b.model_number,b.total_device_cnt_by_model,
+  b.total_device_cnt_by_site
+  from battery_data as a inner join asda_site_data as b
+  on a.serialnumber = b.serial_number 
+  order by serialnumber,device_date, device_hour,device_min ASC
+ );
+
+-- Create variables to get count of devices by site,model_number and at overall site level after joining with ZDS tables.
+create or replace TEMP table `battery_data_1_1` as (
+  select *, COUNT(DISTINCT(serialnumber)) OVER(PARTITION BY site_name,model_number) AS total_device_cnt_by_model_matchZDS,
+  COUNT(DISTINCT(serialnumber)) OVER(PARTITION BY site_name) AS total_device_cnt_by_site_matchZDS,
+  COUNT(DISTINCT(bid)) OVER(PARTITION BY site_name,model_number) AS total_bid_cnt_by_model_matchZDS,
+  COUNT(DISTINCT(bid)) OVER(PARTITION BY site_name) AS total_bid_cnt_by_site_matchZDS
+
+  from battery_data_1
+  order by serialnumber,device_date, device_hour,device_min ASC
+ );
+
+
+create or replace TEMP table `battery_data_site` as (
+select * ,
+CASE
+      WHEN (batt_chng  = 1
+        and prev_battery_level >89 )   THEN 'Testing-Charge'
+      WHEN (batt_chng  = 1
+        and prev_battery_level between 15 and 89 )   THEN 'Inappropriate swap'
+      WHEN (batt_chng  = 1
+        and prev_battery_level < 15  )   THEN 'Appropriate swap'
+    ELSE
+     'No swap'
+    END AS batt_swap
+from (
+select site_name,serialnumber,bid,device_date,device_hour,device_min,battery_level,ac_line_status,last_battery_val,
+model_number,total_device_cnt_by_model,total_device_cnt_by_site,total_device_cnt_by_model_matchZDS,
+total_device_cnt_by_site_matchZDS,total_bid_cnt_by_model_matchZDS,total_bid_cnt_by_site_matchZDS,
+ (LAG(serialnumber)  over (order by site_name,serialnumber,device_date,device_hour,device_min) ) as  prev_serialnumber,
+  (LAG(bid)  over (order by site_name,serialnumber,device_date,device_hour,device_min) ) as  prev_bid,
+  (LAG(device_date)  over (order by site_name,serialnumber,device_date,device_hour,device_min) ) as  prev_device_date,
+  (LAG(device_hour)  over (order by site_name,serialnumber,device_date,device_hour,device_min) ) as  prev_device_hour,
+  (LAG(device_min)  over (order by site_name,serialnumber,device_date,device_hour,device_min) ) as  prev_device_min,
+  (LAG(ac_line_status)  over (order by site_name,serialnumber,device_date,device_hour,device_min,bid) ) as  prev_ac_line_status,
+   (LAG(battery_level)  over (order by site_name,serialnumber,device_date,device_hour,device_min) ) as  prev_battery_level,
+   CASE
+      WHEN (bid  != (LAG(bid)  over (order by site_name,serialnumber,device_date,device_hour,device_min) )
+        and serialnumber = (LAG(serialnumber)  over (order by site_name,serialnumber,device_date,device_hour,device_min) ) )  THEN 1
+    ELSE
+     0
+    END AS batt_chng
+
+   from battery_data_1_1
+    ORDER BY site_name,serialnumber,device_date, device_hour,device_min ASC)
+  ORDER BY site_name,serialnumber,device_date, device_hour,device_min ASC);
+
+create or replace TEMP table `battery_swap_data_site` as (
+  select * , format_date('%Y-%b', device_date) as year_month from battery_data_site
+  where batt_swap != 'No swap');
+
+create or replace table `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.asda_swap_sep24_new` as (
+select * from battery_swap_data_site
+);
+
+-- !!!!!!TO BE RUN SEPARATELY!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!11
+-- To be run separately, develop a code to combine this code or productionize the script
+create or replace TEMP table `swap_24hrs` as ( select *
+FROM `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.asda_swap_nov24_new` where batt_swap != "No swap"
+UNION ALL
+select *
+FROM `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.asda_swap_oct24_new` where batt_swap != "No swap"
+UNION ALL
+select *
+FROM `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.asda_swap_sep24_new` where batt_swap != "No swap"
+
+
+);
+
+create or replace TEMP table `swap_recommendation_threshold` as (
+    select site_name,year_month,model_number,
+    coalesce("Average inappropriate swap per day :" || avg_inappropriate_swaps_per_day) as Comment1,
+    coalesce("Total inappropriate swap:" || total_swaps) as Comment2 from (
+   select site_name,year_month,model_number,round(avg(num_swaps),0) as avg_inappropriate_swaps_per_day,sum(num_swaps) as total_swaps from (
+   select site_name,year_month,model_number,device_date,
+          count(*) as num_swaps from `swap_24hrs` 
+   where  batt_swap = "Inappropriate swap"
+   group by site_name,year_month,model_number,device_date)
+   group by site_name,year_month,model_number)order by site_name,year_month,model_number);
+
+create or replace  table `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.asda_swap_24hrs_new` as (
+select a.*, b.Comment1,b.Comment2
+from `swap_24hrs` as a left join
+`swap_recommendation_threshold` as b
+on a.site_name=b.site_name and
+a.year_month = b.year_month and a.model_number=b.model_number
+order by site_name,year_month,threshold_filter);
+
+-- -- -- !!!!!!TREND DATA!!!!!!
+
+
+create or replace TEMP table `cte` as (
+select site_name,year_month1,model_number,count(*) as inapp_swap from ( 
+select *,format_date('%Y-%m', device_date) as year_month1 from `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.asda_swap_24hrs_new` )
+where batt_swap3 = "Inappropriate swap"  
+-- and site_name = "240-Chester DO"
+group by site_name,year_month1,model_number
+order by site_name,year_month1,model_number);
+
+create or replace TEMP table `cte1` as (  
+     select * from (select *, 
+                   row_number() 
+                     over(partition by site_name,threshold_filter order by year_month1 ) rn from cte));
+
+
+
+create or replace TEMP table `cte2` as (select c1.site_name, 
+       c1.year_month1,c1.model_number,
+       c1.inapp_swap, sum(c1.inapp_swap) OVER(PARTITION BY c1.site_name) AS total_inapp_swap,
+       case when c1.inapp_swap > c2.inapp_swap then 'up'
+            when c1.inapp_swap < c2.inapp_swap then 'down'
+            when c1.inapp_swap = c2.inapp_swap then 'equal'
+       end as Trend
+from cte1 c1
+left join cte1 c2 on c1.site_name = c2.site_name and c1.model_number = c2.model_number and c1.rn-1 = c2.rn
+order by site_name,model_number);
+
+
+-- Change 1 to 4 to track last 4 month increasing trend
+create or replace TEMP table `cte3` as (select *, '1' as trend_flag from 
+(select site_name,model_number,max(total_inapp_swap) as total_inapp_swap, count(*) as ctrend from cte2
+where Trend in ('up') group by site_name,model_number) where ctrend >=2 );
+
+create or replace table `dmsanlytc-cssanlytc-eu-d.TEST_DATA_EU_SS.asda_swap_trend_24hrs_new` as (select c1.*,c2.trend_flag
+from cte2 as c1 inner join cte3 as c2 
+on c1.site_name = c2.site_name and c1.model_number=c2.model_number
+order by total_inapp_swap desc,year_month1,model_number);
+
